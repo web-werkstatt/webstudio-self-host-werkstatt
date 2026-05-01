@@ -1,0 +1,29 @@
+# Geheimnisse — niemals committen
+.env
+.env.local
+.env.*.local
+secrets/
+secrets/*
+
+# Lokale Override-Compose
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# Logs / Run-Artefakte
+*.log
+logs/
+
+# OS / Editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+*~
+
+# Backups
+*.bak
+*.backup.*
+
+# Daten-Verzeichnisse (falls jemand `/data/` ins Repo legt — sollte nicht passieren)
+data/

@@ -1,0 +1,59 @@
+# Caddy-Block fuer Webstudio Builder
+# Einbinden in zentrales Caddyfile (z.B. /etc/caddy/Caddyfile).
+#
+# Voraussetzungen:
+# - DNS-A-Record webstudio.example.com → Server-IP
+# - Container webstudio-app im Caddy-Network (oder reverse_proxy via Host-Port)
+# - bcrypt-Hash fuer basic_auth via:
+#     docker run --rm httpd:alpine htpasswd -nbBC 14 USERNAME 'PASSWORT'
+
+# ============================================================================
+# Variante A — mit basic_auth (Defense-in-Depth, Werkstatt-Single-User)
+# ============================================================================
+webstudio.example.com {
+    encode gzip zstd
+
+    basic_auth {
+        joshko $2y$14$REPLACE-WITH-YOUR-BCRYPT-HASH
+    }
+
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options SAMEORIGIN
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        Referrer-Policy strict-origin-when-cross-origin
+        -Server
+    }
+
+    reverse_proxy webstudio-app:3000 {
+        # Webstudio hat WIP Multiplayer/realtime-Collab (WebSockets/SSE)
+        flush_interval -1
+    }
+}
+
+# ============================================================================
+# Variante B — ohne basic_auth (nur Webstudio-DEV_LOGIN/OAuth schuetzt)
+# ============================================================================
+# webstudio.example.com {
+#     encode gzip zstd
+#
+#     header {
+#         X-Content-Type-Options nosniff
+#         X-Frame-Options SAMEORIGIN
+#         Strict-Transport-Security "max-age=31536000; includeSubDomains"
+#         Referrer-Policy strict-origin-when-cross-origin
+#         -Server
+#     }
+#
+#     reverse_proxy webstudio-app:3000 {
+#         flush_interval -1
+#     }
+# }
+
+# ============================================================================
+# Spaeter: Wildcard fuer Canvas-Iframes (one-per-project)
+# ============================================================================
+# Fuer Live-Canvas-Preview im Builder werden Sub-Subdomains benoetigt
+# (*.webstudio.example.com). Erfordert Wildcard-Cert via DNS-Challenge
+# (z.B. Cloudflare-API-Token). V1 funktioniert ohne, falls Canvas-Preview
+# Probleme macht: nachziehen.

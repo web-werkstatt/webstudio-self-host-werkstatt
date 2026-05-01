@@ -1,0 +1,186 @@
+# Webstudio Builder V1 — Self-Host-Pattern auf SaaS docker-vm
+# Pattern-Quelle: github.com/webstudio-community/webstudio-self-host (commit main, fetched 2026-05-01)
+#
+# Anpassungen vs. Original:
+# - alle Services prefixed `webstudio-` (Container-Naming-Konvention)
+# - proxy-network extern (Caddy davor), KEINE Host-Port-Bindings
+# - Bind-Mounts auf /data/webstudio/{db,minio,uploads} (statt named volumes)
+# - postgres-init.sql lokal aus ./postgres-init.sql gemountet
+# - PUBLISHER und NGINX weggelassen (Bridge nutzt Webstudio-CLI ssg-Export, nicht Publisher;
+#   eigene Subdomain fuer publish later — Folge-Session)
+#
+# Inkrementell hochziehen ist nicht noetig — depends_on-Cascade managed Reihenfolge:
+#   minio (healthy) → minio-init (run-once) ──┐
+#                                              ├→ app
+#   db (healthy) → db-setup (run-once) ────┐   │
+#                                          ├→ migrate (run-once) ─┘
+#                                          └→ postgrest
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  webstudio-db:
+    image: postgres:15-alpine
+    container_name: webstudio-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: webstudio
+    volumes:
+      - /data/webstudio/db:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - proxy-network
+
+  # ── PostgREST permissions (run once) ────────────────────────────────────────
+  # Grants the "anon" role access to all existing tables. Init-SQL kuemmert sich
+  # um zukuenftige Tabellen via DEFAULT PRIVILEGES, dieser Service deckt
+  # bestehende ab (idempotent — bei jedem start re-grant).
+  webstudio-db-setup:
+    image: postgres:15-alpine
+    container_name: webstudio-db-setup
+    restart: "no"
+    depends_on:
+      webstudio-db:
+        condition: service_healthy
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        psql "postgresql://postgres:$$POSTGRES_PASSWORD@webstudio-db:5432/webstudio" \
+          -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'anon') THEN CREATE ROLE anon NOLOGIN; END IF; END \$\$;" \
+          -c "GRANT USAGE ON SCHEMA public TO anon;" \
+          -c "GRANT ALL ON ALL TABLES IN SCHEMA public TO anon;" \
+          -c "GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon;" \
+          -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon;" \
+          -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon;"
+    networks:
+      - proxy-network
+
+  # ── Schema migrations (run once) ────────────────────────────────────────────
+  webstudio-migrate:
+    image: ${BUILDER_IMAGE}
+    container_name: webstudio-migrate
+    restart: "no"
+    depends_on:
+      webstudio-db-setup:
+        condition: service_completed_successfully
+    entrypoint:
+      - /prisma/node_modules/.bin/prisma
+      - migrate
+      - deploy
+      - --schema=/app/prisma/schema.prisma
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@webstudio-db:5432/webstudio
+      DIRECT_URL: postgresql://postgres:${POSTGRES_PASSWORD}@webstudio-db:5432/webstudio
+    networks:
+      - proxy-network
+
+  # ── PostgREST ───────────────────────────────────────────────────────────────
+  webstudio-postgrest:
+    image: postgrest/postgrest:v12.2.0
+    container_name: webstudio-postgrest
+    restart: unless-stopped
+    depends_on:
+      webstudio-db:
+        condition: service_healthy
+      webstudio-migrate:
+        condition: service_completed_successfully
+    environment:
+      PGRST_DB_URI: postgresql://postgres:${POSTGRES_PASSWORD}@webstudio-db:5432/webstudio
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${PGRST_JWT_SECRET}
+      PGRST_DB_SCHEMAS: public
+    networks:
+      - proxy-network
+
+  # ── MinIO (S3-compatible object storage) ────────────────────────────────────
+  webstudio-minio:
+    image: minio/minio:latest
+    container_name: webstudio-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - /data/webstudio/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - proxy-network
+
+  # ── MinIO bucket init (run once) ────────────────────────────────────────────
+  webstudio-minio-init:
+    image: minio/mc:latest
+    container_name: webstudio-minio-init
+    restart: "no"
+    depends_on:
+      webstudio-minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set local http://webstudio-minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD
+        mc mb --ignore-existing local/$$S3_BUCKET
+        mc anonymous set download local/$$S3_BUCKET
+        echo 'Bucket ready.'
+    networks:
+      - proxy-network
+
+  # ── Webstudio builder (Production-Build aus Community-Fork) ─────────────────
+  webstudio-app:
+    image: ${BUILDER_IMAGE}
+    container_name: webstudio-app
+    restart: unless-stopped
+    depends_on:
+      webstudio-migrate:
+        condition: service_completed_successfully
+      webstudio-minio-init:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      APP_FQDN: ${APP_FQDN}
+      POSTGREST_URL: http://webstudio-postgrest:3000
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@webstudio-db:5432/webstudio
+      DIRECT_URL: postgresql://postgres:${POSTGRES_PASSWORD}@webstudio-db:5432/webstudio
+      AUTH_SECRET: ${AUTH_SECRET}
+      DEV_LOGIN: ${DEV_LOGIN}
+      DEV_LOGIN_EMAIL: ${DEV_LOGIN_EMAIL}
+      PGRST_JWT_SECRET: ${PGRST_JWT_SECRET}
+      TRPC_SERVER_API_TOKEN: ${TRPC_SERVER_API_TOKEN}
+      FEATURES: ${FEATURES}
+      USER_PLAN: ${USER_PLAN}
+      MAX_ASSETS_PER_PROJECT: ${MAX_ASSETS_PER_PROJECT}
+      S3_ENDPOINT: ${S3_ENDPOINT}
+      S3_REGION: ${S3_REGION}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+    volumes:
+      - /data/webstudio/uploads:/app/public/s/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - proxy-network
+
+networks:
+  proxy-network:
+    external: true
