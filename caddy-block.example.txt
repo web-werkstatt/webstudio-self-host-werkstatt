@@ -1,19 +1,57 @@
-# Caddy-Block fuer Webstudio Builder
-# Einbinden in zentrales Caddyfile (z.B. /etc/caddy/Caddyfile).
+# Caddyfile-Snippets fuer Webstudio Builder Self-Host
+#
+# WICHTIG — Webstudio braucht ZWEI Hostnamen:
+#   1. webstudio.example.com           → Builder UI (Apex)
+#   2. *.webstudio.example.com         → Project-Canvas-Iframes (Wildcard)
+#
+# Ohne den Wildcard-Block kannst Du KEINE Projekte anlegen oder oeffnen
+# (Browser bekommt NS_ERROR_UNKNOWN_HOST oder /error 400).
 #
 # Voraussetzungen:
-# - DNS-A-Record webstudio.example.com → Server-IP
-# - Container webstudio-app im Caddy-Network (oder reverse_proxy via Host-Port)
+# - DNS-Wildcard-A-Record  *.webstudio.example.com → Server-IP
+#   (zusaetzlich zum Apex-Eintrag webstudio.example.com → Server-IP)
+# - Caddy 2.x mit on_demand_tls (kein Wildcard-Cert noetig — Caddy holt sich
+#   ein einzelnes Cert pro genutzter Project-Subdomain via HTTP-01)
+# - Container webstudio-app im Caddy-Netzwerk (proxy-network)
 # - bcrypt-Hash fuer basic_auth via:
 #     docker run --rm httpd:alpine htpasswd -nbBC 14 USERNAME 'PASSWORT'
+#
+# Volle Schritt-fuer-Schritt-Anleitung: docs/REVERSE-PROXY.md
 
 # ============================================================================
-# Variante A — mit basic_auth (Defense-in-Depth, Werkstatt-Single-User)
+# 1) Globaler Block — on_demand_tls aktivieren + ask-Endpoint registrieren
+# ============================================================================
+# (Gehoert ganz oben ins Caddyfile, ausserhalb jedes Site-Blocks)
+{
+    # ggf. weitere globale Optionen
+    on_demand_tls {
+        ask http://localhost:9001/check
+    }
+}
+
+# ============================================================================
+# 2) Ask-Endpoint — entscheidet ob Caddy ein Cert ausstellen darf
+# ============================================================================
+# Verhindert dass Fremde durch Punkten ihrer eigenen Domain auf Deine IP
+# beliebig viele Certs anfordern (Rate-Limit-DoS auf Lets-Encrypt).
+:9001 {
+    @allowed expression `{http.request.uri.query.domain}.endsWith(".webstudio.example.com")`
+    handle @allowed {
+        respond 200
+    }
+    respond 404
+}
+
+# ============================================================================
+# 3) Apex — Builder UI (mit basic_auth, OAuth-Pfade ausgenommen)
 # ============================================================================
 webstudio.example.com {
     encode gzip zstd
 
-    basic_auth {
+    # basic_auth NUR fuer normale UI-Pfade — /oauth/* und /auth/* MUESSEN frei
+    # bleiben, sonst schlaegt der OAuth-Internal-Flow fehl (401 beim authorize).
+    @needs_auth not path /oauth/* /auth/*
+    basic_auth @needs_auth {
         joshko $2y$14$REPLACE-WITH-YOUR-BCRYPT-HASH
     }
 
@@ -26,34 +64,36 @@ webstudio.example.com {
     }
 
     reverse_proxy webstudio-app:3000 {
-        # Webstudio hat WIP Multiplayer/realtime-Collab (WebSockets/SSE)
         flush_interval -1
+        # Webstudio's preventCrossOriginCookie blockiert Requests mit Sec-Fetch-
+        # Site != "same-origin". Caddy verschluckt browser-eigene Sec-Fetch-
+        # Headers — explizit weiterleiten.
+        header_up Sec-Fetch-Site "same-origin"
     }
 }
 
 # ============================================================================
-# Variante B — ohne basic_auth (nur Webstudio-DEV_LOGIN/OAuth schuetzt)
+# 4) Wildcard — Project-Canvas-Iframes
 # ============================================================================
-# webstudio.example.com {
-#     encode gzip zstd
-#
-#     header {
-#         X-Content-Type-Options nosniff
-#         X-Frame-Options SAMEORIGIN
-#         Strict-Transport-Security "max-age=31536000; includeSubDomains"
-#         Referrer-Policy strict-origin-when-cross-origin
-#         -Server
-#     }
-#
-#     reverse_proxy webstudio-app:3000 {
-#         flush_interval -1
-#     }
-# }
+# KEIN basic_auth (Browser-Iframe kann keine Credentials uebergeben).
+# Auth wird durch Webstudio's OAuth-Token im Cookie gehandhabt.
+*.webstudio.example.com {
+    encode gzip zstd
 
-# ============================================================================
-# Spaeter: Wildcard fuer Canvas-Iframes (one-per-project)
-# ============================================================================
-# Fuer Live-Canvas-Preview im Builder werden Sub-Subdomains benoetigt
-# (*.webstudio.example.com). Erfordert Wildcard-Cert via DNS-Challenge
-# (z.B. Cloudflare-API-Token). V1 funktioniert ohne, falls Canvas-Preview
-# Probleme macht: nachziehen.
+    tls {
+        on_demand
+    }
+
+    header {
+        X-Content-Type-Options nosniff
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        Referrer-Policy strict-origin-when-cross-origin
+        -Server
+        # KEIN X-Frame-Options/SAMEORIGIN hier — Builder embedded das per iframe
+    }
+
+    reverse_proxy webstudio-app:3000 {
+        flush_interval -1
+        header_up Sec-Fetch-Site "same-origin"
+    }
+}

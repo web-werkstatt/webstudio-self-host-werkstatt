@@ -5,8 +5,15 @@ Wiederverwendbares Docker-Compose-Template fuer **Webstudio Builder** auf eigene
 Basiert auf [`webstudio-community/webstudio-self-host`](https://github.com/webstudio-community/webstudio-self-host) — angepasst an Werkstatt-Patterns:
 - `proxy-network` extern, kein Host-Port-Binding
 - Bind-Mounts auf `/data/webstudio/{db,minio,uploads}` statt Named Volumes
-- Caddy-Block-Beispiel mit basic_auth (Defense-in-Depth)
+- Caddy-Block-Beispiel mit basic_auth (Defense-in-Depth) **+ Wildcard-Subdomain
+  fuer Project-Canvas (on-demand TLS, kein DNS-Challenge noetig)**
+- `extra_hosts`-Loopback-Fix fuer OAuth-Token-Tausch (Hairpin-NAT-Workaround)
 - Publisher- und Nginx-Service weggelassen (V1 ohne Publish)
+
+> **WICHTIG:** Webstudio braucht eine **Wildcard-Subdomain** (`*.webstudio.your-domain.com`)
+> fuer Project-Canvas-Iframes — pro Projekt eine eigene Sub-Subdomain. Ohne Wildcard
+> kannst Du keine Projekte anlegen oder oeffnen (`NS_ERROR_UNKNOWN_HOST`).
+> Volle Anleitung: **[`docs/REVERSE-PROXY.md`](docs/REVERSE-PROXY.md)**.
 
 > **Use-Case:** Single-User-Designwerkstatt, hinter `webstudio.your-domain.com`, fuer visuelles Authoring + statischen Export. **Nicht** fuer Multi-User-Production.
 
@@ -21,8 +28,8 @@ Basiert auf [`webstudio-community/webstudio-self-host`](https://github.com/webst
 | Docker Compose | v2 |
 | RAM | ≥ 2 GB frei |
 | Disk | ≥ 10 GB frei |
-| DNS | A-Record `webstudio.your-domain.com` → Server-IP |
-| Reverse-Proxy | Caddy (Beispiel) oder Traefik/Nginx (eigener Block) |
+| DNS | A-Record `webstudio.your-domain.com` → Server-IP **+ Wildcard `*.webstudio.your-domain.com` → Server-IP** |
+| Reverse-Proxy | Caddy 2.x mit `on_demand_tls` (Beispiel) oder Traefik/Nginx mit Wildcard-Cert |
 | Externes Docker-Network | `proxy-network` (anpassbar, siehe `docker-compose.yml`) |
 
 ---
@@ -67,15 +74,25 @@ docker exec webstudio-app wget -qO- http://127.0.0.1:3000/health
 
 ## Reverse-Proxy einrichten
 
-### Caddy
+**Volle Schritt-fuer-Schritt-Anleitung:** [`docs/REVERSE-PROXY.md`](docs/REVERSE-PROXY.md)
+— Wildcard-DNS, Caddy-Snippets, Loopback-Fix, Verify-Tests.
 
-`caddy-block.example.txt` enthaelt zwei Varianten (mit/ohne basic_auth). bcrypt-Hash erzeugen:
+### Caddy (Kurzfassung)
+
+`caddy-block.example.txt` enthaelt vier Bausteine, die alle ins Caddyfile gehoeren:
+
+1. **Globaler Block** mit `on_demand_tls` (kein Wildcard-Cert noetig)
+2. **`:9001` Ask-Endpoint** (Schutz gegen Cert-Issuing-Spam)
+3. **Apex** `webstudio.your-domain.com` mit `basic_auth @needs_auth not path /oauth/* /auth/*`
+4. **Wildcard** `*.webstudio.your-domain.com` mit `tls { on_demand }` — KEIN basic_auth
+
+bcrypt-Hash erzeugen:
 
 ```bash
 docker run --rm httpd:alpine htpasswd -nbBC 14 USERNAME 'PASSWORT'
 ```
 
-Den Block ans zentrale Caddyfile anhaengen, Caddy reload:
+Caddy reload:
 
 ```bash
 caddy reload --config /etc/caddy/Caddyfile
@@ -83,11 +100,14 @@ caddy reload --config /etc/caddy/Caddyfile
 
 ### Traefik
 
-Vorlage siehe `webstudio-community/webstudio-self-host` README (`docker-compose.coolify.yml`). Wichtig: Wildcard-Cert via DNS-Challenge fuer `*.webstudio.your-domain.com` (Canvas-Iframes).
+Vorlage siehe `webstudio-community/webstudio-self-host` README (`docker-compose.coolify.yml`).
+Wichtig: Wildcard-Cert via DNS-Challenge fuer `*.webstudio.your-domain.com` (Canvas-Iframes).
 
 ### Nginx
 
-Nicht out-of-the-box dabei — Caddy-Block-Pattern ist analog uebertragbar (basic_auth, gzip, security-headers, proxy_pass mit WebSocket-Upgrade-Header).
+Nicht out-of-the-box dabei — Caddy-Block-Pattern ist analog uebertragbar (basic_auth,
+gzip, security-headers, proxy_pass mit WebSocket-Upgrade-Header). Wichtig: `Sec-Fetch-Site`
+beim proxy_pass auf `same-origin` setzen, sonst blockiert Webstudio mit 400.
 
 ---
 
@@ -155,6 +175,9 @@ Bekannte Stolpersteine in [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md). 
 - **HTTP 403 trotz richtiger Caddy-Konfig** → `APP_FQDN` falsch gesetzt; muss exakt zu Reverse-Proxy-Domain passen
 - **PostgREST `could not look up local user ID 1000`** → `PGRST_DB_URI` ist nicht gesetzt (PostgREST 12 kennt kein `_FILE`-Suffix); ENV-Variable inline setzen
 - **`pnpm dev` aus dem Source-Klon scheitert** → Builder-Source hat hardcoded `wstd.dev` in `vite.config.ts`; Self-Host-Image vom Community-Fork nutzen (das Image hat bereits die Patches)
+- **`NS_ERROR_UNKNOWN_HOST` beim Project-Anlegen** → Wildcard-DNS + Wildcard-Caddy-Block fehlt, siehe [`docs/REVERSE-PROXY.md`](docs/REVERSE-PROXY.md)
+- **`/error 400` "Cross-origin request"** → `header_up Sec-Fetch-Site "same-origin"` im reverse_proxy fehlt; basic_auth blockt OAuth-Pfade
+- **`fetch failed` beim Project-Open** → Hairpin-NAT, `extra_hosts` mit Reverse-Proxy-Container-IP setzen (siehe `.env.example` + `docker-compose.yml`)
 
 ---
 

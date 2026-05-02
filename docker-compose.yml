@@ -180,6 +180,21 @@ services:
       retries: 5
     networks:
       - proxy-network
+    extra_hosts:
+      # Loopback-Fix fuer OAuth-Token-Tausch:
+      # Beim Anlegen/Oeffnen eines Projekts fetcht der Builder seine eigene
+      # public URL (APP_FQDN) ueber den /oauth/ws/token-Endpoint. Hairpin-NAT
+      # vom Container zur public IP funktioniert auf vielen Docker-Hosts NICHT
+      # ("Connection refused" / "fetch failed"). Workaround: APP_FQDN container-
+      # intern auf die Reverse-Proxy-Container-IP im proxy-network mappen —
+      # Token-Request laeuft dann webstudio-app -> Caddy:443 (TLS, Cert OK)
+      # -> Caddy reverse-proxy -> webstudio-app:3000.
+      #
+      # IP des Reverse-Proxy-Containers ermitteln:
+      #   docker inspect <proxy-container> \
+      #     --format '{{(index .NetworkSettings.Networks "proxy-network").IPAddress}}'
+      # Bei Proxy-Restart pruefen ob die IP gleich blieb.
+      - "${APP_FQDN}:${REVERSE_PROXY_IP:-172.21.0.3}"
 
 networks:
   proxy-network:

@@ -10,10 +10,12 @@ Bekannte Stolpersteine + Loesungen aus dem ersten Setup.
 4. [Postgres-Volume inkompatibel nach Image-Wechsel](#4-postgres-volume-inkompatibel-nach-image-wechsel)
 5. [TLS-Cert-Issuing scheitert](#5-tls-cert-issuing-scheitert)
 6. [Builder zeigt nach Login leere Seite](#6-builder-zeigt-nach-login-leere-seite)
-7. [Canvas-Iframe broken](#7-canvas-iframe-broken)
+7. [Canvas-Iframe / Project-Subdomain broken (NS_ERROR_UNKNOWN_HOST)](#7-canvas-iframe--project-subdomain-broken-ns_error_unknown_host)
 8. [DEV_LOGIN-Page fragt jedes Mal nach Auth-Secret](#8-dev_login-page-fragt-jedes-mal-nach-auth-secret)
 9. [Migrations fail mit `extensions.uuid_generate_v4 does not exist`](#9-migrations-fail-mit-extensionsuuid_generate_v4-does-not-exist)
 10. [Container-Restart-Loop mit ENV-Validation-Error](#10-container-restart-loop-mit-env-validation-error)
+11. [`/error 400` nach Login / "Cross-origin request"](#11-error-400-nach-login--cross-origin-request)
+12. [`fetch failed` beim Project-Anlegen oder -Oeffnen (Hairpin-NAT)](#12-fetch-failed-beim-project-anlegen-oder-oeffnen-hairpin-nat)
 
 ---
 
@@ -141,17 +143,36 @@ Falls externer MinIO-Zugriff gewollt: separate Subdomain mit Caddy-Block fuer Mi
 
 ---
 
-## 7. Canvas-Iframe broken
+## 7. Canvas-Iframe / Project-Subdomain broken (NS_ERROR_UNKNOWN_HOST)
 
-**Symptom:** Builder laedt, Layout-Editor sichtbar, aber Live-Canvas-Preview ist leer/Iframe-Error.
+**Symptom:** Beim Anlegen oder Oeffnen eines Projekts laedt der Browser eine
+URL der Form `https://p-<uuid>.webstudio.your-domain.com/...` und scheitert mit
+`NS_ERROR_UNKNOWN_HOST`, `DNS_PROBE_FINISHED_NXDOMAIN`, oder TLS-Error.
 
-**Ursache:** Webstudio Canvas-Iframes nutzen Sub-Subdomains (`<projekt>.webstudio.your-domain.com`). Ohne Wildcard-DNS + Wildcard-TLS-Cert scheitert der Iframe-Load.
+**Ursache:** Webstudio braucht **zwei** Hostnamen:
+1. Apex `webstudio.your-domain.com` fuer die Builder-UI
+2. Wildcard `*.webstudio.your-domain.com` fuer Canvas-Iframes — **eine
+   eigene Subdomain pro Projekt**, OAuth-Token-Tausch laeuft auch darueber.
 
-**Loesung:** Wildcard-Subdomain einrichten (siehe `docs/DEPLOY.md` Abschnitt 9). Erfordert:
-- DNS-A-Record `*.webstudio.your-domain.com`
-- Caddy mit DNS-Challenge fuer Wildcard-Cert (Cloudflare-API-Token o.ae.)
+**Loesung:** Wildcard-DNS + on-demand TLS einrichten — keine DNS-Challenge,
+kein Wildcard-Cert noetig. Volle Anleitung: **[docs/REVERSE-PROXY.md](REVERSE-PROXY.md)**.
 
-V1-Workaround ohne Wildcard: Canvas-Preview in eigenem Tab oeffnen statt Iframe.
+Kurzfassung:
+1. DNS: A-Record `*.webstudio.your-domain.com → <server-ip>`
+2. Caddy: globaler `on_demand_tls`-Block + Wildcard-Site mit `tls { on_demand }`
+3. Apex-Caddy-Block: `basic_auth` darf **nicht** auf `/oauth/*` und `/auth/*`
+   greifen, sonst schlaegt der OAuth-Internal-Flow fehl.
+4. Caddy reload — Caddy holt sich pro Project-Subdomain ein einzelnes
+   Lets-Encrypt-Cert beim ersten Aufruf.
+
+**Verify:**
+```bash
+# 1. DNS muss aufloesen
+dig +short test.webstudio.your-domain.com    # → server-ip
+# 2. TLS muss bei ersten Aufruf live ausgestellt werden
+curl -sI https://test.webstudio.your-domain.com/health   # 200 oder 401
+docker logs caddy 2>&1 | grep "certificate obtained successfully"
+```
 
 ---
 
@@ -204,6 +225,105 @@ docker compose config | grep -E "AUTH_SECRET|POSTGRES_PASSWORD|PGRST_JWT_SECRET|
 ```
 
 **Loesung:** `.env` neu pruefen, alle „change-me"-Werte ersetzen, dann `docker compose up -d --force-recreate webstudio-app`.
+
+---
+
+## 11. `/error 400` nach Login / "Cross-origin request"
+
+**Symptom:** Nach erfolgreichem DEV_LOGIN landest Du beim Anlegen/Oeffnen
+eines Projekts auf `https://p-<uuid>.webstudio.your-domain.com/error` mit
+HTTP 400. Container-Log zeigt:
+```
+Cross-origin request to /builder/.../oauth/ws/authorize is forbidden
+```
+
+**Ursache:** Webstudio hat einen `preventCrossOriginCookie`-Schutz, der
+Requests mit `Sec-Fetch-Site != "same-origin"` ablehnt. Caddy verschluckt
+die browser-eigenen `Sec-Fetch-*`-Headers beim Reverse-Proxy-Hop, fuer
+Webstudio sieht der Request dadurch nicht mehr als same-origin aus.
+
+Zweite Ursachen-Variante: `basic_auth` auf der Apex-Domain blockt den
+OAuth-Authorize-Endpoint mit 401 — der Browser bekommt nie einen Cookie
+und der Token-Tausch schlaegt fehl.
+
+**Loesung:**
+
+1. Im Apex- **und** Wildcard-Reverse-Proxy-Block den Header explizit setzen:
+   ```caddy
+   reverse_proxy webstudio-app:3000 {
+       flush_interval -1
+       header_up Sec-Fetch-Site "same-origin"
+   }
+   ```
+2. Apex-`basic_auth` muss `/oauth/*` und `/auth/*` ausnehmen:
+   ```caddy
+   @needs_auth not path /oauth/* /auth/*
+   basic_auth @needs_auth {
+       USERNAME $2y$14$...
+   }
+   ```
+
+Caddy reload + Browser-Cache loeschen (Hard-Reload oder Inkognito).
+Voll-Beispiel: `caddy-block.example.txt` in diesem Repo.
+
+**Verify:**
+```bash
+docker logs webstudio-app 2>&1 | grep -i "cross-origin"
+# sollte nach Fix still bleiben
+```
+
+---
+
+## 12. `fetch failed` beim Project-Anlegen oder -Oeffnen (Hairpin-NAT)
+
+**Symptom:** Sec-Fetch-Site und OAuth-Bypass sind gefixt, Project-Subdomain
+ist erreichbar, aber das Projekt-Anlegen/Oeffnen scheitert mit Builder-Log:
+```
+fetch failed
+TypeError: fetch failed
+  at fetch (.../oauth/ws/token)
+```
+
+**Ursache:** Hairpin-NAT-Problem. Beim OAuth-Internal-Flow fetcht der Builder
+seine eigene public URL `https://webstudio.your-domain.com/oauth/ws/token`.
+Auf vielen Docker-Hosts kann ein Container die public IP des Hosts nicht
+erreichen ("Connection refused"), weil der Router/iptables Hairpin-Routing
+nicht macht.
+
+**Loesung:** Im Container den eigenen FQDN auf die Reverse-Proxy-Container-IP
+mappen — der Token-Request laeuft dann container-intern ueber das Proxy-Netz
+(Caddy:443 → reverse_proxy → webstudio-app:3000), das Cert ist trotzdem gueltig.
+
+1. Reverse-Proxy-Container-IP ermitteln:
+   ```bash
+   docker inspect <proxy-container> \
+     --format '{{(index .NetworkSettings.Networks "proxy-network").IPAddress}}'
+   ```
+2. In `.env` setzen:
+   ```env
+   REVERSE_PROXY_IP=172.21.0.3
+   ```
+3. `docker-compose.yml` enthaelt bereits den `extra_hosts`-Mapping fuer
+   `webstudio-app`:
+   ```yaml
+   extra_hosts:
+     - "${APP_FQDN}:${REVERSE_PROXY_IP:-172.21.0.3}"
+   ```
+4. Container neu starten:
+   ```bash
+   docker compose up -d --force-recreate webstudio-app
+   ```
+
+**Achtung:** Bei Caddy-/Proxy-Restart kann sich die Container-IP aendern.
+Wenn `fetch failed` ploetzlich wieder auftritt → IP neu pruefen, `.env`
+und `extra_hosts` updaten, Container neu starten.
+
+**Verify:**
+```bash
+docker exec webstudio-app sh -c \
+  "wget -qO- --header='Host: ${APP_FQDN}' https://${APP_FQDN}/health"
+# erwartet: HTTP 200 (oder 401 falls basic_auth — Hauptsache kein Connection-Error)
+```
 
 ---
 
